@@ -76,13 +76,13 @@ class AhmedFileCols:
     BRZ_KEYFIG      = 5
 
 class MasterCols:
-    KEY        = 0
-    PLATFORM   = 2
-    FACTOR     = 5
-    PLC        = 6
-    CANON      = 12
-    PL         = 17
-    DATA_START = 2
+    KEY        = 3    # Col D: PRODUCT_MODEL_NM (e.g. CE285A) ← lookup key
+    PLATFORM   = 1    # Col B: Platform
+    FACTOR     = 5    # Col F: Unit Quantity (singles conversion)
+    PLC        = 6    # Col G: Planning Part Lifecycle
+    CANON      = 12   # Col M: Canon-grouped Platform
+    PL         = 17   # Col R: PL
+    DATA_START = 2    # Data starts at row 3 (index 2, skip 2 header rows)
 
 # ════════════════════════════════════════════════════════════════════════════
 #  HELPERS
@@ -377,7 +377,7 @@ with left:
         key="prev"
     )
     master_file = st.file_uploader(
-        "③ Master Vlookup（Table）",
+        "③ Master Vlookup（Table-Nov25）",
         type=["xlsx", "xlsm"],
         help="从 SharePoint 下载的最新 Master Vlookup 文件",
         key="master"
