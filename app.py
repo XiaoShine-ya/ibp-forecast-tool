@@ -140,7 +140,7 @@ def build_m0_fcst(ahmed_bytes, master):
     out["PRODUCT_MODEL_NR"] = df.iloc[:, AhmedFileCols.FCST_PRIMARY].astype(str).str.strip()
     out["Reg"]              = df.iloc[:, AhmedFileCols.FCST_THEATER].astype(str).str.strip()
 
-    valid = out["PRODUCT_MODEL_NR"].isin(master.index) & (out["PRODUCT_MODEL_NR"] != "nan")
+    valid = out["PRODUCT_MODEL_NR"] != "nan"
     out = out[valid].copy().reset_index(drop=True)
     df  = df[valid].copy().reset_index(drop=True)
 
