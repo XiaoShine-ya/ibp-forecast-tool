@@ -190,9 +190,9 @@ def compute_changes(m0, m1, month_labels):
     id_cols = ["Reg","PRODUCT_MODEL_NR","PRODUCT_PLATFORM_NM","Canon-Shared Cap","PL","PLC","ConC"]
     changes = m0[id_cols].copy()
     changes["Values"] = "Sum of DELTA_M0-M1_QT"
-    m1_lkp = m1.set_index("ConC") if (not m1.empty and "ConC" in m1.columns) else pd.DataFrame()
+    m1_lkp = m1.groupby("ConC").last() if (not m1.empty and "ConC" in m1.columns) else pd.DataFrame()
     for lbl in month_labels:
-        m0_vals = m0.set_index("ConC")[lbl] if lbl in m0.columns else pd.Series(dtype=float)
+        m0_vals = m0.groupby("ConC")[lbl].sum() if lbl in m0.columns else pd.Series(dtype=float)
         if not m1_lkp.empty and lbl in m1_lkp.columns:
             m1_vals = m1_lkp[lbl].apply(pd.to_numeric, errors='coerce').fillna(0)
             delta   = m0_vals.subtract(m1_vals, fill_value=0)
@@ -211,7 +211,7 @@ def build_compare_packs(m0, m1, changes, month_labels, lbl_m0, lbl_m1, m1_act_la
     for lbl in fcst_months:
         m0_rows[lbl] = m0[lbl].values if lbl in m0.columns else 0
 
-    m1_lkp = m1.set_index("ConC") if (not m1.empty and "ConC" in m1.columns) else pd.DataFrame()
+    m1_lkp = m1.groupby("ConC").last() if (not m1.empty and "ConC" in m1.columns) else pd.DataFrame()
     m1_rows = m0[id_cols].copy()
     m1_rows["Forecast Cycle"] = lbl_m1
     if not m1_lkp.empty and m1_act_label in m1_lkp.columns:
