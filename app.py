@@ -111,7 +111,7 @@ def read_xlsb(file_bytes: bytes, sheetname: str) -> pd.DataFrame:
     finally:
         os.unlink(tmp_path)
 
-def load_master(file_bytes: bytes, sheet: str = "Table-Nov25") -> pd.DataFrame:
+def load_master(file_bytes: bytes, sheet: str = "Table") -> pd.DataFrame:
     df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=sheet, header=None)
     df = df.iloc[MasterCols.DATA_START:].copy()
     df.columns = range(len(df.columns))
@@ -377,7 +377,7 @@ with left:
         key="prev"
     )
     master_file = st.file_uploader(
-        "③ Master Vlookup（Table-Nov25）",
+        "③ Master Vlookup（Table）",
         type=["xlsx", "xlsm"],
         help="从 SharePoint 下载的最新 Master Vlookup 文件",
         key="master"
