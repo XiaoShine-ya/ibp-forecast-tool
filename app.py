@@ -198,6 +198,7 @@ def compute_changes(m0, m1, month_labels):
             delta   = m0_vals.subtract(m1_vals, fill_value=0)
         else:
             delta = m0_vals
+        delta = delta[~delta.index.duplicated(keep="last")]
         changes[lbl] = changes["ConC"].map(delta).fillna(0)
     return changes
 
