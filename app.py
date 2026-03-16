@@ -1,527 +1,778 @@
-"""
-IBP Forecast Compare – Streamlit Web App
-Run locally:  streamlit run app.py
-"""
-
 import streamlit as st
-import pandas as pd
 import openpyxl
-from openpyxl.styles import PatternFill, Font, Alignment
+from openpyxl.styles import Font, PatternFill
+from openpyxl.styles.colors import Color
 from openpyxl.utils import get_column_letter
-import io
-import traceback
+import pyxlsb
+import os
+import re
+import tempfile
 from datetime import datetime
+from dateutil.relativedelta import relativedelta
+from io import BytesIO
 
-# ── Try pyxlsb ──────────────────────────────────────────────────────────────
-try:
-    import pyxlsb
-    XLSB_OK = True
-except ImportError:
-    XLSB_OK = False
 
-# ── Page config ─────────────────────────────────────────────────────────────
-st.set_page_config(
-    page_title="IBP Forecast Compare Tool",
-    page_icon="📊",
-    layout="wide",
-)
+# ================================================================
+# Data Reading
+# ================================================================
 
-# ── Custom CSS ───────────────────────────────────────────────────────────────
-st.markdown("""
-<style>
-    .main-header {
-        background: linear-gradient(90deg, #1F4E79 0%, #2E75B6 100%);
-        padding: 20px 30px; border-radius: 10px; margin-bottom: 24px;
-        color: white;
-    }
-    .main-header h1 { color: white; margin: 0; font-size: 26px; }
-    .main-header p  { color: #BDD7EE; margin: 4px 0 0 0; font-size: 14px; }
-    .section-box {
-        background: #F0F4F8; border-left: 4px solid #2E75B6;
-        padding: 12px 16px; border-radius: 6px; margin-bottom: 16px;
-    }
-    .success-box {
-        background: #E2EFDA; border-left: 4px solid #375623;
-        padding: 12px 16px; border-radius: 6px;
-    }
-    .warning-box {
-        background: #FFF2CC; border-left: 4px solid #C55A11;
-        padding: 12px 16px; border-radius: 6px;
-    }
-    div[data-testid="stButton"] button {
-        background: #217346; color: white; font-weight: bold;
-        font-size: 16px; padding: 10px 32px; border-radius: 8px;
-        border: none; width: 100%;
-    }
-    div[data-testid="stButton"] button:hover { background: #1a5c38; }
-</style>
-""", unsafe_allow_html=True)
-
-# ════════════════════════════════════════════════════════════════════════════
-#  COLUMN CONFIGURATION  (update if Ahmed changes his file layout)
-# ════════════════════════════════════════════════════════════════════════════
-class AhmedFileCols:
-    FCST_PRIMARY    = 5    # Col F → PRODUCT_MODEL_NR
-    FCST_THEATER    = 6    # Col G → Reg / Theater
-    FCST_HDR_ROW    = 0
-    FCST_DATA_START = 1
-    FCST_MO_START   = 9    # Col J → first forecast month
-    FCST_MO_END     = 26   # Col AA → last forecast month (18 months)
-    EX_PRIMARY      = 3    # Col D
-    EX_THEATER      = 4    # Col E
-    BRZ_BASE_PL     = 1
-    BRZ_PLATFORM    = 2
-    BRZ_PRIMARY     = 3
-    BRZ_THEATER     = 4
-    BRZ_KEYFIG      = 5
-
-class MasterCols:
-    KEY        = 3    # Col D: PRODUCT_MODEL_NM (e.g. CE285A) ← lookup key
-    PLATFORM   = 1    # Col B: Platform
-    FACTOR     = 5    # Col F: Unit Quantity (singles conversion)
-    PLC        = 6    # Col G: Planning Part Lifecycle
-    CANON      = 12   # Col M: Canon-grouped Platform
-    PL         = 17   # Col R: PL
-    DATA_START = 2    # Data starts at row 3 (index 2, skip 2 header rows)
-
-# ════════════════════════════════════════════════════════════════════════════
-#  HELPERS
-# ════════════════════════════════════════════════════════════════════════════
-def excel_col_to_index(col_letter: str) -> int:
-    col_letter = col_letter.strip().upper()
-    result = 0
-    for ch in col_letter:
-        result = result * 26 + (ord(ch) - ord('A') + 1)
-    return result - 1
-
-def read_xlsb(file_bytes: bytes, sheetname: str) -> pd.DataFrame:
-    if not XLSB_OK:
-        raise ImportError("pyxlsb not installed. See requirements.txt.")
-    import pyxlsb, tempfile, os
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsb") as tmp:
-        tmp.write(file_bytes)
-        tmp_path = tmp.name
-    try:
-        rows = []
-        with pyxlsb.open_workbook(tmp_path) as wb:
-            with wb.get_sheet(sheetname) as ws:
-                for row in ws.rows():
-                    rows.append([c.v for c in row])
-        return pd.DataFrame(rows) if rows else pd.DataFrame()
-    finally:
-        os.unlink(tmp_path)
-
-def load_master(file_bytes: bytes, sheet: str = "Table") -> pd.DataFrame:
-    df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=sheet, header=None)
-    df = df.iloc[MasterCols.DATA_START:].copy()
-    df.columns = range(len(df.columns))
-    df = df[df[MasterCols.KEY].notna()].copy()
-    df[MasterCols.KEY] = df[MasterCols.KEY].astype(str).str.strip()
-    df = df.drop_duplicates(subset=MasterCols.KEY)
-    return df.set_index(MasterCols.KEY)
-
-def vlook(key, master, col, default=""):
-    try:
-        v = master.loc[str(key).strip(), col]
-        return v if pd.notna(v) else default
-    except Exception:
-        return default
-
-# ════════════════════════════════════════════════════════════════════════════
-#  CORE PROCESSING
-# ════════════════════════════════════════════════════════════════════════════
-def build_m0_fcst(ahmed_bytes, master):
-    raw = read_xlsb(ahmed_bytes, "Final Supplies Fcst SKU to Base")
-    header_row   = raw.iloc[AhmedFileCols.FCST_HDR_ROW].tolist()
-    month_labels = header_row[AhmedFileCols.FCST_MO_START : AhmedFileCols.FCST_MO_END + 1]
-    df = raw.iloc[AhmedFileCols.FCST_DATA_START:].copy().reset_index(drop=True)
-
-    out = pd.DataFrame()
-    out["PRODUCT_MODEL_NR"] = df.iloc[:, AhmedFileCols.FCST_PRIMARY].astype(str).str.strip()
-    out["Reg"]              = df.iloc[:, AhmedFileCols.FCST_THEATER].astype(str).str.strip()
-
-    valid = out["PRODUCT_MODEL_NR"] != "nan"
-    out = out[valid].copy().reset_index(drop=True)
-    df  = df[valid].copy().reset_index(drop=True)
-
-    out["PRODUCT_PLATFORM_NM"] = out["PRODUCT_MODEL_NR"].map(lambda x: vlook(x, master, MasterCols.PLATFORM))
-    out["Canon-Shared Cap"]    = out["PRODUCT_MODEL_NR"].map(lambda x: vlook(x, master, MasterCols.CANON))
-    out["PL"]                  = out["PRODUCT_MODEL_NR"].map(lambda x: vlook(x, master, MasterCols.PL))
-    out["PLC"]                 = out["PRODUCT_MODEL_NR"].map(lambda x: vlook(x, master, MasterCols.PLC))
-    out["ConC"]                = out["Reg"] + out["PRODUCT_MODEL_NR"]
-    out["Values"]              = "Sum of M-0 FRCST_QT"
-    out["Factor"]              = out["PRODUCT_MODEL_NR"].map(
-        lambda x: pd.to_numeric(vlook(x, master, MasterCols.FACTOR, 1), errors='coerce') or 1)
-    out["M1_Actuals"] = 0.0
-
-    for i, col_idx in enumerate(range(AhmedFileCols.FCST_MO_START, AhmedFileCols.FCST_MO_END + 1)):
-        lbl = month_labels[i]
-        out[lbl] = pd.to_numeric(df.iloc[:, col_idx], errors='coerce').fillna(0)
-
-    return out, month_labels
-
-def build_trade_actuals(ahmed_bytes, master, actuals_col_idx):
-    raw_ex = read_xlsb(ahmed_bytes, "L10 SHIP BASE ex-Brazil")
-    raw_ex = raw_ex.iloc[1:].reset_index(drop=True)
-    a = pd.DataFrame()
-    a["WORLD_REGION_CD"] = raw_ex.iloc[:, AhmedFileCols.EX_THEATER].astype(str).str.strip()
-    a["BASE_PROD_NR"]    = raw_ex.iloc[:, AhmedFileCols.EX_PRIMARY].astype(str).str.strip()
-    a["Sum_SHIP_QT"]     = pd.to_numeric(raw_ex.iloc[:, actuals_col_idx], errors='coerce').fillna(0)
-    a["Conc"]            = a["WORLD_REGION_CD"] + a["BASE_PROD_NR"]
-    a = a[a["Sum_SHIP_QT"] != 0].copy().reset_index(drop=True)
-    return a
-
-def load_m1_fcst(prev_bytes):
-    df = pd.read_excel(io.BytesIO(prev_bytes), sheet_name="PACKS-M0 Fcst",
-                       header=None, engine="openpyxl")
-    headers = df.iloc[2].tolist()
-    data    = df.iloc[3:].copy()
-    data.columns = headers
-    data = data.reset_index(drop=True)
-    if "Values" in data.columns:
-        data = data.rename(columns={"Values": "KF"})
-    if "KF" in data.columns:
-        data["KF"] = "Sum of M-1 FRCST_QT"
-    if "ConC" not in data.columns and "Reg" in data.columns:
-        data["ConC"] = data["Reg"].astype(str) + data["PRODUCT_MODEL_NR"].astype(str)
+def read_ahmed_forecast(path_or_buf):
+    """Read 'Final Supplies Fcst SKU to Base' tab.
+    Returns dict[(region, sku)] = [18 forecast values]
+    """
+    data = {}
+    with pyxlsb.open_workbook(path_or_buf) as wb:
+        with wb.get_sheet("Final Supplies Fcst SKU to Base") as ws:
+            for i, row in enumerate(ws.rows()):
+                vals = [c.v for c in row]
+                if i == 0:
+                    continue
+                sku = vals[4]   # Primary Base Product
+                reg = vals[5]   # Theater
+                if not sku or not reg:
+                    continue
+                fcst = [v if v is not None else 0 for v in vals[8:26]]
+                data[(reg, sku)] = fcst
     return data
 
-def compute_changes(m0, m1, month_labels):
-    id_cols = ["Reg","PRODUCT_MODEL_NR","PRODUCT_PLATFORM_NM","Canon-Shared Cap","PL","PLC","ConC"]
-    changes = m0[id_cols].copy()
-    changes["Values"] = "Sum of DELTA_M0-M1_QT"
-    m1_lkp = m1.groupby("ConC").last() if (not m1.empty and "ConC" in m1.columns) else pd.DataFrame()
-    for lbl in month_labels:
-        m0_vals = m0.groupby("ConC")[lbl].sum() if lbl in m0.columns else pd.Series(dtype=float)
-        if not m1_lkp.empty and lbl in m1_lkp.columns:
-            m1_vals = m1_lkp[lbl].apply(pd.to_numeric, errors='coerce').fillna(0)
-            delta   = m0_vals.subtract(m1_vals, fill_value=0)
-        else:
-            delta = m0_vals
-        delta = delta[~delta.index.duplicated(keep="last")]
-        changes[lbl] = changes["ConC"].map(delta).fillna(0)
-    return changes
 
-def build_compare_packs(m0, m1, changes, month_labels, lbl_m0, lbl_m1, m1_act_label):
-    id_cols = ["Reg","PRODUCT_MODEL_NR","PRODUCT_PLATFORM_NM","Canon-Shared Cap","PL","PLC","ConC"]
-    fcst_months = month_labels[1:]
+def read_ahmed_actuals(path_or_buf, col_letter):
+    """Read 'L10 SHIP BASE ex-BRAZIL' tab actuals column.
+    Returns dict[(region, sku)] = actual_value
+    """
+    col_idx = ord(col_letter.upper()) - ord("A")
+    data = {}
+    with pyxlsb.open_workbook(path_or_buf) as wb:
+        with wb.get_sheet("L10 SHIP BASE ex-BRAZIL") as ws:
+            for i, row in enumerate(ws.rows()):
+                if i == 0:
+                    continue
+                vals = [c.v for c in row]
+                sku = vals[3]   # Primary Base Product
+                reg = vals[4]   # Theater
+                if not sku or not reg:
+                    continue
+                val = vals[col_idx] if col_idx < len(vals) else None
+                data[(reg, sku)] = val if val is not None else 0
+    return data
 
-    m0_rows = m0[id_cols].copy()
-    m0_rows["Forecast Cycle"]      = lbl_m0
-    m0_rows["M1_Actuals_Display"]  = m0["M1_Actuals"].values
-    for lbl in fcst_months:
-        m0_rows[lbl] = m0[lbl].values if lbl in m0.columns else 0
 
-    m1_lkp = m1.groupby("ConC").last() if (not m1.empty and "ConC" in m1.columns) else pd.DataFrame()
-    m1_rows = m0[id_cols].copy()
-    m1_rows["Forecast Cycle"] = lbl_m1
-    if not m1_lkp.empty and m1_act_label in m1_lkp.columns:
-        m1_rows["M1_Actuals_Display"] = m1_rows["ConC"].map(
-            m1_lkp[m1_act_label].apply(pd.to_numeric, errors='coerce').fillna(0)).fillna(0)
-    else:
-        m1_rows["M1_Actuals_Display"] = 0
-    for lbl in fcst_months:
-        if not m1_lkp.empty and lbl in m1_lkp.columns:
-            m1_rows[lbl] = m1_rows["ConC"].map(
-                m1_lkp[lbl].apply(pd.to_numeric, errors='coerce').fillna(0)).fillna(0)
-        else:
-            m1_rows[lbl] = 0
+def read_master(path_or_buf):
+    """Read Master Vlookup 'Table' tab.
+    Lookup key = Material (Col A). Returns dict[material] = {...}
+    """
+    lookup = {}
+    wb = openpyxl.load_workbook(path_or_buf, data_only=True)
+    ws = wb["Table"]
+    for r in range(3, ws.max_row + 1):
+        material = ws.cell(r, 1).value   # Col A = Material
+        if not material:
+            continue
+        key = str(material).strip()
+        lookup[key] = {
+            "platform":  ws.cell(r, 3).value,    # Col C = Product Name
+            "factor":    ws.cell(r, 6).value,    # Col F = Unit Quantity
+            "plc":       ws.cell(r, 7).value,    # Col G = PLC
+            "canon_cap": ws.cell(r, 13).value,   # Col M = Canon-Shared Cap
+            "pl":        ws.cell(r, 18).value,   # Col R = PL
+        }
+    wb.close()
+    return lookup
 
-    delta_rows = changes[id_cols].copy()
-    delta_rows["Forecast Cycle"]     = "DELTA"
-    delta_rows["M1_Actuals_Display"] = (
-        m0_rows.set_index("ConC")["M1_Actuals_Display"]
-        .subtract(m1_rows.set_index("ConC")["M1_Actuals_Display"], fill_value=0)
-    ).reindex(delta_rows["ConC"]).values
-    for lbl in fcst_months:
-        delta_rows[lbl] = changes[lbl].values if lbl in changes.columns else 0
 
-    combined = []
-    for conc in m0["ConC"].tolist():
-        combined.append(m0_rows[m0_rows["ConC"] == conc])
-        combined.append(m1_rows[m1_rows["ConC"] == conc])
-        combined.append(delta_rows[delta_rows["ConC"] == conc])
+def _parse_sheet_header_date(value):
+    """Parse either a datetime cell or a Feb-26 style header string."""
+    if isinstance(value, datetime):
+        return datetime(value.year, value.month, 1)
+    if isinstance(value, str):
+        text = value.strip()
+        try:
+            parsed = datetime.strptime(text, "%b-%y")
+            return datetime(parsed.year, parsed.month, 1)
+        except ValueError:
+            return None
+    return None
 
-    result = pd.concat(combined, ignore_index=True)
-    result = result.rename(columns={"M1_Actuals_Display": m1_act_label})
-    return result.drop(columns=["ConC"])
 
-def build_platform_summary(changes, month_labels):
-    fcst_months = month_labels[1:]
-    avail = [l for l in fcst_months if l in changes.columns]
-    pivot = changes.groupby("PRODUCT_PLATFORM_NM")[avail].sum().reset_index()
-    return pivot.rename(columns={"PRODUCT_PLATFORM_NM": "Platform"})
+def read_prev_compare(path_or_buf, m1_label):
+    """Read previous compare file, extract M-1 rows.
+    Returns (dict[(reg,sku)] = {date: value}, set of available dates)
+    """
+    m1_data = {}
+    wb = openpyxl.load_workbook(path_or_buf, data_only=True)
+    ws = wb["Compare Packs"]
 
-# ════════════════════════════════════════════════════════════════════════════
-#  EXCEL WRITER  (returns bytes for download)
-# ════════════════════════════════════════════════════════════════════════════
-CLR_DARK  = "1F4E79"
-CLR_MID   = "2E75B6"
-CLR_M0    = "D6E4F0"
-CLR_M1    = "E2EFDA"
-CLR_DELTA = "FFF2CC"
-CLR_WHITE = "FFFFFF"
+    # Map column numbers to dates from header
+    date_cols = {}
+    for c in range(1, ws.max_column + 1):
+        v = ws.cell(1, c).value
+        parsed_date = _parse_sheet_header_date(v)
+        if parsed_date is not None:
+            date_cols[c] = parsed_date
+    available_dates = set(date_cols.values())
 
-def _hdr(cell, bg=CLR_DARK, fg=CLR_WHITE, bold=True, sz=10):
-    cell.fill = PatternFill("solid", fgColor=bg)
-    cell.font = Font(color=fg, bold=bold, size=sz, name="Calibri")
-    cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    # Read rows matching M-1 label
+    for r in range(2, ws.max_row + 1):
+        cycle = ws.cell(r, 8).value
+        if cycle != m1_label:
+            continue
+        reg = ws.cell(r, 1).value
+        sku = ws.cell(r, 2).value
+        if not reg or not sku:
+            continue
+        reg = str(reg).strip()
+        sku = str(sku).strip()
+        vals = {}
+        for c, dt in date_cols.items():
+            v = ws.cell(r, c).value
+            vals[dt] = v if v is not None else 0
+        m1_data[(reg, sku)] = vals
 
-def _num(cell):
-    cell.number_format = '#,##0'
-    cell.alignment = Alignment(horizontal="right")
+    wb.close()
+    return m1_data, available_dates
 
-def write_excel(compare_df, platform_df, changes_df, month_labels) -> bytes:
+
+# ================================================================
+# Date Generation
+# ================================================================
+
+def make_output_dates(m0_cycle):
+    """Generate 19 output dates: 1 actuals month + 18 forecast months."""
+    year = int(m0_cycle[:4])
+    month = int(m0_cycle[4:6])
+
+    # Actuals = month before M0
+    act_y, act_m = (year, month - 1) if month > 1 else (year - 1, 12)
+    dates = [datetime(act_y, act_m, 1)]
+
+    # 18 forecast months starting from M0
+    for i in range(18):
+        m = month + i
+        y = year + (m - 1) // 12
+        m = ((m - 1) % 12) + 1
+        dates.append(datetime(y, m, 1))
+
+    return dates
+
+
+# ================================================================
+# Core Processing
+# ================================================================
+
+def process(ahmed_buf, prev_buf, master_buf,
+            m0_cycle, m1_cycle, m0_label, m1_label, actuals_col):
+    """Main processing: read all files, compute compare, return (bytes, count)."""
+
+    fcst_data = read_ahmed_forecast(ahmed_buf)
+    actuals_data = read_ahmed_actuals(ahmed_buf, actuals_col)
+    master = read_master(master_buf)
+    m1_data, prev_avail_dates = read_prev_compare(prev_buf, m1_label)
+
+    output_dates = make_output_dates(m0_cycle)
+
+    # Union of all (region, sku) keys from Ahmed forecast and previous compare
+    all_keys = set(fcst_data.keys()) | set(m1_data.keys())
+
+    factor_map = {}
+    rows = []
+    for reg, sku in sorted(all_keys):
+        # Master lookup - skip if not found
+        info = master.get(str(sku).strip())
+        if not info:
+            continue
+
+        # Cache factor for Singles calculation
+        f = info.get("factor")
+        factor_map[str(sku).strip()] = f if isinstance(f, (int, float)) and f else 1
+
+        conc = f"{reg}{sku}"
+        base = [reg, sku, info["platform"], info["canon_cap"],
+                info["pl"], info["plc"], conc]
+
+        # --- M0 row: actuals + 18 forecast ---
+        actual = actuals_data.get((reg, sku), 0)
+        fcst = fcst_data.get((reg, sku), [0] * 18)
+        m0_vals = [actual] + list(fcst)
+
+        # --- M-1 row: align by date ---
+        m1_dict = m1_data.get((reg, sku), None)
+        m1_vals = []
+        for dt in output_dates:
+            if m1_dict is not None:
+                m1_vals.append(m1_dict.get(dt))
+            elif dt in prev_avail_dates:
+                m1_vals.append(0)
+            else:
+                m1_vals.append(None)
+
+        # --- DELTA row ---
+        delta = []
+        for i in range(len(output_dates)):
+            v0 = m0_vals[i] if i < len(m0_vals) and m0_vals[i] is not None else 0
+            v1 = m1_vals[i] if i < len(m1_vals) and m1_vals[i] is not None else 0
+            delta.append(v0 - v1)
+
+        rows.append(base + [m0_label] + m0_vals)
+        rows.append(base + [m1_label] + m1_vals)
+        rows.append(base + ["DELTA"] + delta)
+
+    # Write to temp file (needed for win32com PivotTable creation)
+    tmp_dir = tempfile.mkdtemp()
+    tmp_path = os.path.join(tmp_dir, "output.xlsx")
+    write_excel(rows, output_dates, m0_label, m1_label,
+                m0_cycle, m1_cycle, tmp_path, factor_map)
+
+    with open(tmp_path, "rb") as f:
+        result_bytes = f.read()
+    os.remove(tmp_path)
+    os.rmdir(tmp_dir)
+
+    return result_bytes, len(rows) // 3
+
+
+# ================================================================
+# Excel Output
+# ================================================================
+
+# ---------- Shared styles ----------
+
+_HEADER_FILL = PatternFill(
+    fgColor=Color(theme=8, tint=0.7999816888943144), fill_type="solid")
+_HEADER_FONT = Font(bold=True)
+_M1_FILL = PatternFill(
+    fgColor=Color(theme=0, tint=-0.0499893185216834), fill_type="solid")
+_DELTA_FILL = PatternFill(
+    fgColor=Color(theme=7, tint=0.7999816888943144), fill_type="solid")
+_GOLD_FILL = PatternFill(
+    fgColor=Color(theme=7, tint=0.7999816888943144), fill_type="solid")
+_ORANGE_FILL = PatternFill(
+    fgColor=Color(theme=5, tint=0.7999816888943144), fill_type="solid")
+
+_NUM_FMT = r'#,##0_ ;[Red]\-#,##0\ '
+_PIVOT_NUM_FMT = r'#,##0_);[Red](#,##0)'
+
+
+def _date_label(dt):
+    """Format datetime as 'Feb-26' style label."""
+    return dt.strftime("%b-%y")
+
+
+def _make_singles_rows(rows, factor_map):
+    """Multiply all value columns by the per-SKU factor."""
+    singles = []
+    for row_data in rows:
+        sku = str(row_data[1]).strip()
+        factor = factor_map.get(sku, 1)
+        new_row = list(row_data[:8])  # base fields + cycle label unchanged
+        for v in row_data[8:]:
+            if isinstance(v, (int, float)):
+                new_row.append(v * factor)
+            else:
+                new_row.append(v)
+        singles.append(new_row)
+    return singles
+
+
+def write_excel(rows, dates, m0_label, m1_label,
+                m0_cycle, m1_cycle, path, factor_map):
+    """Write output workbook with 6 tabs matching reference format."""
     wb = openpyxl.Workbook()
-    fcst_months = month_labels[1:]
 
-    # ── Compare Packs ──────────────────────────────────────
-    ws1 = wb.active
-    ws1.title = "Compare Packs"
-    ws1.freeze_panes = "I2"
-    row_fills = {
-        "DELTA": PatternFill("solid", fgColor=CLR_DELTA),
-        "M1":    PatternFill("solid", fgColor=CLR_M1),
-        "M0":    PatternFill("solid", fgColor=CLR_M0),
-    }
-    if not compare_df.empty:
-        hdrs = list(compare_df.columns)
-        for c, h in enumerate(hdrs, 1):
-            cell = ws1.cell(row=1, column=c, value=str(h) if h else "")
-            _hdr(cell)
-            ws1.column_dimensions[get_column_letter(c)].width = 18 if c <= 7 else 12
-        for r, (_, row) in enumerate(compare_df.iterrows(), 2):
-            cy = str(row.get("Forecast Cycle", ""))
-            fill = row_fills["DELTA"] if "DELTA" in cy.upper() else (
-                   row_fills["M1"] if any(x in cy.upper() for x in ["FEB","MAR","APR","MAY","JUN","M-1","M1"]) and "DELTA" not in cy.upper() else
-                   row_fills["M0"])
-            for c, val in enumerate(row, 1):
-                cell = ws1.cell(row=r, column=c)
-                cell.value = round(val, 6) if isinstance(val, float) else val
-                cell.fill = fill
-                if c > 8:
-                    _num(cell)
-                    if isinstance(val, (int, float)) and val < 0:
-                        cell.font = Font(color="C00000", name="Calibri", size=10)
-        ws1.auto_filter.ref = f"A1:{get_column_letter(len(hdrs))}1"
+    singles_rows = _make_singles_rows(rows, factor_map)
 
-    # ── Changes by Platform ────────────────────────────────
-    ws2 = wb.create_sheet("Changes by Platform")
-    ws2.freeze_panes = "B4"
-    ws2["A1"] = "PACKS – Forecast Delta by Platform"
-    ws2["A1"].font = Font(bold=True, size=12, color=CLR_DARK, name="Calibri")
-    if not platform_df.empty:
-        hdr_row = 3
-        for c, h in enumerate(platform_df.columns, 1):
-            cell = ws2.cell(row=hdr_row, column=c, value=str(h) if h else "")
-            _hdr(cell, bg="203864")
-            ws2.column_dimensions[get_column_letter(c)].width = 28 if c == 1 else 13
-        for r, (_, row) in enumerate(platform_df.iterrows(), hdr_row + 1):
-            for c, val in enumerate(row, 1):
-                cell = ws2.cell(row=r, column=c)
-                cell.value = round(val, 2) if isinstance(val, float) else val
-                if c > 1:
-                    _num(cell)
-                    if isinstance(val, (int, float)) and val < 0:
-                        cell.font = Font(color="C00000", name="Calibri")
+    # --- Packs sheets ---
+    ws_pivot = wb.active
+    ws_pivot.title = "Pivot"
+    ws_cbp = wb.create_sheet("Changes by Platform")
+    ws_cp = wb.create_sheet("Compare Packs")
+    ws_pd = wb.create_sheet("PivotData")
 
-    # ── Pivot Data ─────────────────────────────────────────
-    ws3 = wb.create_sheet("Pivot Data")
-    ws3.freeze_panes = "A2"
-    if not changes_df.empty:
-        keep = [c for c in changes_df.columns if c != "Factor"]
-        for c, h in enumerate(keep, 1):
-            cell = ws3.cell(row=1, column=c, value=str(h) if h else "")
-            _hdr(cell, bg=CLR_MID)
-            ws3.column_dimensions[get_column_letter(c)].width = 20 if c <= 7 else 13
-        for r, (_, row) in enumerate(changes_df[keep].iterrows(), 2):
-            for c, val in enumerate(row, 1):
-                cell = ws3.cell(row=r, column=c)
-                cell.value = round(val, 6) if isinstance(val, float) else val
+    # --- Singles sheets ---
+    ws_cs = wb.create_sheet("Compare Singles")
+    ws_cbps = wb.create_sheet("Changes by Platform Singles")
+    ws_pivots = wb.create_sheet("Pivot Singles")
+    ws_pds = wb.create_sheet("PivotData Singles")
 
-    buf = io.BytesIO()
-    wb.save(buf)
-    return buf.getvalue()
+    _write_compare_packs(ws_cp, rows, dates, m0_label, m1_label)
+    _write_changes_by_platform(ws_cbp, rows, dates, m0_label, m1_label,
+                               m0_cycle, m1_cycle)
+    _write_pivot_data(ws_pd, rows, dates)
 
-# ════════════════════════════════════════════════════════════════════════════
-#  STREAMLIT UI
-# ════════════════════════════════════════════════════════════════════════════
+    _write_compare_packs(ws_cs, singles_rows, dates, m0_label, m1_label)
+    _write_changes_by_platform(ws_cbps, singles_rows, dates, m0_label, m1_label,
+                               m0_cycle, m1_cycle, label="SINGLES")
+    _write_pivot_data(ws_pds, singles_rows, dates)
 
-# ── Header ───────────────────────────────────────────────────────────────────
-st.markdown("""
-<div class="main-header">
-  <h1>📊 IBP Forecast Compare Tool</h1>
-  <p>上传文件 → 填写设置 → 点击生成 → 下载 Excel 输出</p>
-</div>
-""", unsafe_allow_html=True)
+    wb.save(path)
 
-if not XLSB_OK:
-    st.error("⚠️  缺少依赖库 pyxlsb。请确认 requirements.txt 已包含 pyxlsb，并重新部署。")
-    st.stop()
+    # Post-process: create real PivotTables + CUMM Delta via Excel COM
+    _create_pivot_tables(path, rows, singles_rows, dates, m0_cycle)
 
-# ── Layout: 2 columns ────────────────────────────────────────────────────────
-left, right = st.columns([1.1, 1])
 
-with left:
-    st.markdown("### 📂 上传文件")
+# ==================== Compare Packs ====================
 
-    ahmed_file = st.file_uploader(
-        "① Ahmed File（当前 cycle）",
-        type=["xlsb"],
-        help="WW_Validation_xx-xx-xxxx.xlsb",
-        key="ahmed"
-    )
-    prev_file = st.file_uploader(
-        "② Previous Working File（上一个 cycle）",
-        type=["xlsx", "xlsm"],
-        help="上一个 cycle 的 working.xlsx，其 PACKS-M0 Fcst tab 将作为本次 M-1",
-        key="prev"
-    )
-    master_file = st.file_uploader(
-        "③ Master Vlookup（Table-Nov25）",
-        type=["xlsx", "xlsm"],
-        help="从 SharePoint 下载的最新 Master Vlookup 文件",
-        key="master"
+def _write_compare_packs(ws, rows, dates, m0_label, m1_label):
+    # Header row
+    date_labels = [_date_label(dt) for dt in dates]
+    header = ["Reg", "PRODUCT_MODEL_NR", "PRODUCT_PLATFORM_NM",
+              "Canon-Shared Cap", "PL", "PLC", "ConC",
+              "Forecast Cycle"] + date_labels
+    for c, v in enumerate(header, 1):
+        cell = ws.cell(1, c, v)
+        cell.fill = _HEADER_FILL
+        cell.font = _HEADER_FONT
+
+    # Data rows
+    for r_idx, row_data in enumerate(rows, 2):
+        cycle = row_data[7]
+        for c_idx, v in enumerate(row_data, 1):
+            cell = ws.cell(r_idx, c_idx, v)
+            # Row fill
+            if cycle == m1_label:
+                cell.fill = _M1_FILL
+            elif cycle == "DELTA":
+                cell.fill = _DELTA_FILL
+            # Number format for date columns
+            if c_idx >= 9:
+                cell.number_format = _NUM_FMT
+
+    # Autofilter
+    last_col = get_column_letter(len(header))
+    ws.auto_filter.ref = f"A1:{last_col}{ws.max_row}"
+
+    # Freeze panes (just below header, to the right of col H)
+    ws.freeze_panes = "I2"
+
+
+# ==================== Changes by Platform ====================
+
+def _write_changes_by_platform(ws, rows, dates, m0_label, m1_label,
+                               m0_cycle, m1_cycle, label="PACKS"):
+    # Determine month short names from cycles
+    m0_month = datetime(int(m0_cycle[:4]), int(m0_cycle[4:6]), 1).strftime("%b")
+    m1_month = datetime(int(m1_cycle[:4]), int(m1_cycle[4:6]), 1).strftime("%b")
+
+    # Use first 12 dates, split into 6 + 6
+    first6 = dates[0:6]
+    second6 = dates[6:12]
+
+    # Aggregate DELTA by platform
+    plat_delta = {}
+    for row_data in rows:
+        if row_data[7] != "DELTA":
+            continue
+        plat = row_data[2]  # PRODUCT_PLATFORM_NM
+        vals = row_data[8:]  # all 19 date values
+        if plat not in plat_delta:
+            plat_delta[plat] = [0.0] * len(dates)
+        for i, v in enumerate(vals):
+            if isinstance(v, (int, float)):
+                plat_delta[plat][i] += v
+
+    # Sort by sum of first 6 months descending (most positive first)
+    # Secondary sort: alphabetical (case-insensitive) for ties
+    sorted_plats = sorted(
+        plat_delta.items(),
+        key=lambda x: (-sum(x[1][:6]), x[0].upper())
     )
 
-with right:
-    st.markdown("### ⚙️ Cycle 设置")
+    # --- Row 1: label + SUBTOTAL formulas ---
+    ws.cell(1, 1, label).font = Font(bold=True)
+    # SUBTOTAL for first 6 date cols (B-G)
+    for ci in range(2, 8):
+        col_l = get_column_letter(ci)
+        cell = ws.cell(1, ci, f"=SUBTOTAL(9,{col_l}4:{col_l}9999)")
+        cell.number_format = _NUM_FMT
+    # SUBTOTAL for col H (Total change)
+    ws.cell(1, 8, "=SUBTOTAL(9,H4:H9999)").number_format = _NUM_FMT
+    # Col I: no subtotal (None)
+    # SUBTOTAL for second 6 date cols (J-O)
+    for ci in range(10, 10 + len(second6)):
+        col_l = get_column_letter(ci)
+        cell = ws.cell(1, ci, f"=SUBTOTAL(9,{col_l}4:{col_l}9999)")
+        cell.number_format = _NUM_FMT
+    # SUBTOTAL for remaining empty cols (P-W) to match reference
+    for ci in range(10 + len(second6), 24):
+        col_l = get_column_letter(ci)
+        cell = ws.cell(1, ci, f"=SUBTOTAL(9,{col_l}4:{col_l}9999)")
+        cell.number_format = _NUM_FMT
 
-    c1, c2 = st.columns(2)
-    with c1:
-        cycle_m0 = st.text_input("M0 Cycle（当前）", value="202604", max_chars=6)
-        label_m0 = st.text_input("M0 Label", value="Apr Forecast")
-    with c2:
-        cycle_m1 = st.text_input("M-1 Cycle（上一个）", value="202603", max_chars=6)
-        label_m1 = st.text_input("M-1 Label", value="Mar Forecast")
+    # --- Row 2: Title ---
+    ws.cell(2, 1, f"{m0_month} vs {m1_month} Fcst Delta").font = Font(bold=True)
+    ws.cell(2, 9, "Not considered in compare packs").number_format = _NUM_FMT
 
-    st.markdown("---")
-    st.markdown("### 📅 Actuals Column  ⚠️ 每次必填")
+    # --- Row 3: Headers ---
+    ws.cell(3, 1, "Row Labels")
+    ws.cell(3, 1).fill = _HEADER_FILL
+    ws.cell(3, 1).font = _HEADER_FONT
 
-    actuals_col = st.text_input(
-        "Ahmed L10 表中 M-1 Actuals 所在列（Excel 字母）",
-        value="M",
-        max_chars=2,
-        help="例：March cycle → M（26-Feb）｜April cycle → N（26-Mar）"
-    ).strip().upper()
+    # First 6 date columns (B-G)
+    for i, dt in enumerate(first6):
+        ci = 2 + i
+        cell = ws.cell(3, ci, _date_label(dt))
+        cell.fill = _HEADER_FILL
+        cell.font = _HEADER_FONT
 
-    # Quick reference table
+    # Col H: Total change till Q3
+    cell_h = ws.cell(3, 8, "Total change till Q3")
+    cell_h.fill = PatternFill(
+        fgColor=Color(theme=7, tint=0.7999816888943144), fill_type="solid")
+    cell_h.font = _HEADER_FONT
+
+    # Col I: Off cycle change
+    cell_i = ws.cell(3, 9, f"{m1_month} Off cycle change")
+    cell_i.fill = PatternFill(
+        fgColor=Color(theme=5, tint=0.7999816888943144), fill_type="solid")
+    cell_i.font = _HEADER_FONT
+
+    # Second 6 date columns (J-O)
+    for i, dt in enumerate(second6):
+        ci = 10 + i
+        cell = ws.cell(3, ci, _date_label(dt))
+        cell.fill = _HEADER_FILL
+        cell.font = _HEADER_FONT
+
+    # --- Row 4+: Platform data ---
+    for r_off, (plat, all_vals) in enumerate(sorted_plats):
+        r = 4 + r_off
+        ws.cell(r, 1, plat)
+
+        # First 6 months
+        for i in range(6):
+            cell = ws.cell(r, 2 + i, all_vals[i])
+            cell.number_format = _NUM_FMT
+
+        # Col H: SUM formula for first 6 months
+        cell_h = ws.cell(r, 8, f"=SUM(B{r}:G{r})")
+        cell_h.number_format = _NUM_FMT
+
+        # Col I: Off cycle = 0
+        cell_i = ws.cell(r, 9, 0)
+        cell_i.number_format = _NUM_FMT
+
+        # Second 6 months
+        for i in range(len(second6)):
+            cell = ws.cell(r, 10 + i, all_vals[6 + i])
+            cell.number_format = _NUM_FMT
+
+    # Autofilter: A3:W{last_row} matching reference
+    last_data_row = 3 + len(sorted_plats)
+    ws.auto_filter.ref = f"A3:W{last_data_row}"
+
+    # Freeze panes
+    ws.freeze_panes = "B4"
+
+
+# ==================== PivotData (hidden source sheet) ====================
+
+def _write_pivot_data(ws, rows, dates):
+    """Write flat DELTA-only data for PivotTable source.
+    Columns: Reg, PRODUCT_MODEL_NR, PRODUCT_PLATFORM_NM, Forecast Cycle,
+             then one column per month with string header like 'Feb-26'.
+    """
+    month_labels = [_date_label(dt) for dt in dates]
+    header = ["Reg", "PRODUCT_MODEL_NR", "PRODUCT_PLATFORM_NM",
+              "Forecast Cycle"] + month_labels
+    for c, v in enumerate(header, 1):
+        ws.cell(1, c, v)
+
+    r = 2
+    for row_data in rows:
+        if row_data[7] != "DELTA":
+            continue
+        ws.cell(r, 1, row_data[0])   # Reg
+        ws.cell(r, 2, row_data[1])   # PRODUCT_MODEL_NR
+        ws.cell(r, 3, row_data[2])   # PRODUCT_PLATFORM_NM
+        ws.cell(r, 4, row_data[7])   # Forecast Cycle = "DELTA"
+        for ci, v in enumerate(row_data[8:]):
+            ws.cell(r, 5 + ci, v if isinstance(v, (int, float)) else 0)
+        r += 1
+
+    ws.sheet_state = 'hidden'
+
+
+# ==================== PivotTable + CUMM Delta via win32com ====================
+
+def _build_one_pivot(wb, data_sheet, pivot_sheet, a1_label, table_name,
+                     rows, dates):
+    """Create one real PivotTable + CUMM Delta section on the given sheets."""
+    # Pre-compute CUMM Delta data
+    delta_dates = dates[:18]
+    act = dates[0]
+    cumm_start = act - relativedelta(months=1)
+    cumm_dates = [cumm_start] + list(delta_dates)
+
+    regions = ["AMERICAS", "ASIA PACIFIC", "EMEA"]
+    region_delta = {r: [0.0] * len(dates) for r in regions}
+    for row_data in rows:
+        if row_data[7] != "DELTA":
+            continue
+        reg = row_data[0]
+        if reg not in region_delta:
+            continue
+        for i, v in enumerate(row_data[8:]):
+            if isinstance(v, (int, float)):
+                region_delta[reg][i] += v
+
+    grand = [0.0] * len(dates)
+    for reg in regions:
+        for i in range(len(dates)):
+            grand[i] += region_delta[reg][i]
+
+    ws_data = wb.Sheets(data_sheet)
+    ws_pivot = wb.Sheets(pivot_sheet)
+
+    # ---- Create PivotTable ----
+    last_row = ws_data.Cells(ws_data.Rows.Count, 1).End(-4162).Row  # xlUp
+    last_col = ws_data.Cells(1, ws_data.Columns.Count).End(-4159).Column  # xlToLeft
+    data_range = ws_data.Range(
+        ws_data.Cells(1, 1),
+        ws_data.Cells(last_row, last_col)
+    )
+
+    pc = wb.PivotCaches().Create(
+        SourceType=1,  # xlDatabase
+        SourceData=data_range
+    )
+
+    pt = pc.CreatePivotTable(
+        TableDestination=ws_pivot.Range('A7'),
+        TableName=table_name
+    )
+
+    # Write label at A1 (above PivotTable)
+    ws_pivot.Cells(1, 1).Value = a1_label
+    ws_pivot.Cells(1, 1).Font.Bold = True
+
+    # Filters (page fields) — add in reverse visual order
+    pf_plat = pt.PivotFields('PRODUCT_PLATFORM_NM')
+    pf_plat.Orientation = 3  # xlPageField
+
+    pf_cycle = pt.PivotFields('Forecast Cycle')
+    pf_cycle.Orientation = 3  # xlPageField
+    pf_cycle.CurrentPage = 'DELTA'
+
+    # Row field: Reg only
+    pf_reg = pt.PivotFields('Reg')
+    pf_reg.Orientation = 1  # xlRowField
+    pf_reg.Position = 1
+
+    # Value fields: Sum of each delta month column (18 months)
+    month_labels = [_date_label(dt) for dt in delta_dates]
+    for ml in month_labels:
+        df = pt.AddDataField(
+            pt.PivotFields(ml),
+            'Sum of %s' % ml,
+            -4157  # xlSum
+        )
+        df.NumberFormat = _PIVOT_NUM_FMT
+
+    # Layout: no subtotals
+    pf_reg.Subtotals = (False,) * 12
+
+    pt.ColumnGrand = True
+    pt.RowGrand = False
+
+    # Show classic PivotTable layout with in-grid drop zones
+    pt.InGridDropZones = True
+
+    # Fix header label: "Row Labels" -> "Reg"
+    pt.CompactLayoutRowHeader = 'Reg'
+
+    # ---- Write CUMM Delta at fixed row 19 ----
+    r19 = 19
+    cell_cumm = ws_pivot.Cells(r19, 1)
+    cell_cumm.Value = 'CUMM Delta'
+    cell_cumm.Font.Bold = True
+
+    gold_rgb = 0xC0DCF3  # BGR for Excel (light gold ~#F3DCC0)
+    cell_cumm.Interior.Color = gold_rgb
+
+    r20 = r19 + 1
+    ws_pivot.Cells(r20, 1).Value = 'Region'
+    ws_pivot.Cells(r20, 1).Interior.Color = gold_rgb
+    cumm_labels = ['Sum of %s' % _date_label(dt) for dt in cumm_dates]
+    for ci, lbl in enumerate(cumm_labels):
+        c = ws_pivot.Cells(r20, 2 + ci)
+        c.Value = lbl
+        c.Interior.Color = gold_rgb
+
+    # Region cumulative rows
+    for ri, reg in enumerate(regions):
+        cumm_r = r20 + 1 + ri
+        ws_pivot.Cells(cumm_r, 1).Value = reg
+        running = 0.0
+        for ci in range(len(cumm_dates)):
+            if ci == 0:
+                running = region_delta[reg][0]
+            elif ci < len(delta_dates):
+                running += region_delta[reg][ci]
+            cell = ws_pivot.Cells(cumm_r, 2 + ci)
+            cell.Value = running
+            cell.NumberFormat = _PIVOT_NUM_FMT
+
+    # Grand Total cumulative row
+    gt_row = r20 + 1 + len(regions)
+    gt_rgb = 0xD5D5D5  # light gray for Grand Total
+    ws_pivot.Cells(gt_row, 1).Value = 'Grand Total'
+    ws_pivot.Cells(gt_row, 1).Font.Bold = True
+    ws_pivot.Cells(gt_row, 1).Interior.Color = gt_rgb
+    running = 0.0
+    for ci in range(len(cumm_dates)):
+        if ci == 0:
+            running = grand[0]
+        elif ci < len(delta_dates):
+            running += grand[ci]
+        cell = ws_pivot.Cells(gt_row, 2 + ci)
+        cell.Value = running
+        cell.NumberFormat = _PIVOT_NUM_FMT
+        cell.Font.Bold = True
+        cell.Interior.Color = gt_rgb
+
+    # Column widths
+    ws_pivot.Columns('A').ColumnWidth = 29.5
+    ws_pivot.Columns('B').ColumnWidth = 15.125
+    ws_pivot.Columns('H').ColumnWidth = 15.125
+    ws_pivot.Columns('I').ColumnWidth = 15.125
+
+
+def _create_pivot_tables(path, rows, singles_rows, dates, m0_cycle):
+    """Open workbook via COM and create PivotTables for both Packs and Singles."""
+    import win32com.client as win32
+    import pythoncom
+
+    abs_path = os.path.abspath(path)
+
+    pythoncom.CoInitialize()
+    excel = None
+    try:
+        excel = win32.gencache.EnsureDispatch('Excel.Application')
+        excel.Visible = False
+        excel.DisplayAlerts = False
+        excel.ScreenUpdating = False
+
+        wb = excel.Workbooks.Open(abs_path)
+
+        _build_one_pivot(wb, 'PivotData', 'Pivot',
+                         'PACKS', 'PivotDelta', rows, dates)
+        _build_one_pivot(wb, 'PivotData Singles', 'Pivot Singles',
+                         'SINGLES', 'PivotDeltaSingles', singles_rows, dates)
+
+        wb.Save()
+        wb.Close(False)
+    finally:
+        if excel:
+            excel.ScreenUpdating = True
+            excel.DisplayAlerts = True
+            excel.Quit()
+        pythoncom.CoUninitialize()
+
+
+# ================================================================
+# Streamlit UI
+# ================================================================
+
+_MONTH_NAMES = {
+    1: "Jan", 2: "Feb", 3: "Mar", 4: "Apr", 5: "May", 6: "Jun",
+    7: "Jul", 8: "Aug", 9: "Sep", 10: "Oct", 11: "Nov", 12: "Dec",
+}
+
+_ACTUALS_COL_MAP = {
+    "202603": "M", "202604": "N", "202605": "O", "202606": "P",
+}
+
+
+def _parse_prev_filename(name):
+    """Extract M-1 cycle from previous compare filename and derive defaults.
+    E.g. '202602 vs 202601 IBP Forecast Compare.xlsx' → m1='202602', m0='202603'
+    """
+    m = re.match(r"(\d{6})\s+vs\s+\d{6}", name)
+    if not m:
+        return None
+    m1_cycle = m.group(1)
+    m1_year = int(m1_cycle[:4])
+    m1_month = int(m1_cycle[4:6])
+    m0_dt = datetime(m1_year, m1_month, 1) + relativedelta(months=1)
+    m0_cycle = m0_dt.strftime("%Y%m")
+    m0_label = f"{_MONTH_NAMES[m0_dt.month]} Forecast"
+    m1_label = f"{_MONTH_NAMES[m1_month]} Forecast"
+    actuals_col = _ACTUALS_COL_MAP.get(m0_cycle, "M")
+    return m0_cycle, m1_cycle, m0_label, m1_label, actuals_col
+
+
+def main():
+    st.set_page_config(page_title="IBP Forecast Compare Tool", layout="wide")
+    st.title("IBP Forecast Compare Tool")
+
+    # --- File uploaders ---
+    st.subheader("Upload Files")
+    c1, c2, c3 = st.columns(3)
+    ahmed_file = c1.file_uploader("Ahmed File (.xlsb)", type=["xlsb"])
+    prev_file = c2.file_uploader("Previous Compare File (.xlsx)", type=["xlsx"])
+    master_file = c3.file_uploader("Master Vlookup (.xlsx)", type=["xlsx"])
+
+    # --- Auto-detect cycles from prev filename ---
+    defaults = None
+    if prev_file is not None:
+        defaults = _parse_prev_filename(prev_file.name)
+
+    def_m0 = defaults[0] if defaults else "202603"
+    def_m1 = defaults[1] if defaults else "202602"
+    def_m0_label = defaults[2] if defaults else "Mar Forecast"
+    def_m1_label = defaults[3] if defaults else "Feb Forecast"
+    def_actuals = defaults[4] if defaults else "M"
+
+    # --- Settings ---
+    st.subheader("Settings")
     st.markdown("""
-| Cycle | 月份 | 列字母 |
-|-------|------|--------|
-| 202603 March | 26-Feb | **M** |
-| 202604 April | 26-Mar | **N** |
-| 202605 May   | 26-Apr | **O** |
-| 202606 June  | 26-May | **P** |
+| Cycle | Actuals Month | Column Letter |
+|---|---|---|
+| 202603 March | 26-Feb | M |
+| 202604 April | 26-Mar | N |
+| 202605 May | 26-Apr | O |
+| 202606 June | 26-May | P |
 """)
 
-# ── Run button ───────────────────────────────────────────────────────────────
-st.markdown("---")
-run = st.button("▶  生成 IBP Forecast Compare", use_container_width=True)
+    s1, s2, s3 = st.columns(3)
+    m0_cycle = s1.text_input("M0 Cycle", def_m0)
+    m1_cycle = s2.text_input("M-1 Cycle", def_m1)
+    actuals_col = s3.text_input("Actuals Column Letter", def_actuals)
 
-if run:
-    # Validate inputs
-    missing = []
-    if not ahmed_file:  missing.append("Ahmed File (.xlsb)")
-    if not prev_file:   missing.append("Previous Working File (.xlsx)")
-    if not master_file: missing.append("Master Vlookup (.xlsx)")
-    if not actuals_col: missing.append("Actuals Column 字母")
+    s4, s5 = st.columns(2)
+    m0_label = s4.text_input("M0 Label", def_m0_label)
+    m1_label = s5.text_input("M-1 Label", def_m1_label)
 
-    if missing:
-        st.warning("请先上传以下文件：\n" + "\n".join(f"• {m}" for m in missing))
-        st.stop()
+    # --- Generate ---
+    all_uploaded = ahmed_file is not None and prev_file is not None and master_file is not None
+    if st.button("Generate Compare File", type="primary", disabled=not all_uploaded):
+        # pyxlsb needs a file on disk for .xlsb
+        tmp_dir = tempfile.mkdtemp()
+        ahmed_tmp = os.path.join(tmp_dir, ahmed_file.name)
+        with open(ahmed_tmp, "wb") as f:
+            f.write(ahmed_file.getvalue())
 
-    try:
-        actuals_col_idx = excel_col_to_index(actuals_col)
-    except Exception:
-        st.error(f"Actuals Column 格式不正确：'{actuals_col}'，请输入 Excel 列字母，例如 M")
-        st.stop()
-
-    progress = st.progress(0)
-    status   = st.empty()
-
-    try:
-        # 1. Master
-        status.info("📖  加载 Master Vlookup...")
-        master = load_master(master_file.read())
-        progress.progress(15)
-        status.info(f"✅  Master Vlookup: {len(master):,} 个 SKU")
-
-        # 2. M0
-        status.info("📊  读取 Ahmed File → PACKS-M0 Fcst...")
-        ahmed_bytes = ahmed_file.read()
-        m0_df, month_labels = build_m0_fcst(ahmed_bytes, master)
-        progress.progress(35)
-        status.info(f"✅  M0 Fcst: {len(m0_df):,} 行 | {len(month_labels)} 个月")
-
-        # 3. Actuals
-        status.info("📦  读取 Trade Actuals (L10)...")
-        actuals_df = build_trade_actuals(ahmed_bytes, master, actuals_col_idx)
-        act_lkp    = actuals_df.set_index("Conc")["Sum_SHIP_QT"]
-        m0_df["M1_Actuals"] = m0_df["ConC"].map(act_lkp).fillna(0)
-        m1_act_label = month_labels[0]
-        fcst_months  = month_labels[1:]
-        progress.progress(55)
-
-        # 4. M-1
-        status.info("📁  加载 M-1 Fcst（上一个 cycle）...")
-        m1_df = load_m1_fcst(prev_file.read())
-        progress.progress(65)
-
-        # 5. Changes
-        status.info("🔢  计算 PACKS-Fcst Changes...")
-        changes_df = compute_changes(m0_df, m1_df, fcst_months)
-        progress.progress(75)
-
-        # 6. Compare Packs
-        status.info("📋  构建 Compare Packs...")
-        compare_df = build_compare_packs(
-            m0_df, m1_df, changes_df,
-            month_labels, label_m0, label_m1, m1_act_label
-        )
-        progress.progress(85)
-
-        # 7. Platform summary
-        platform_df = build_platform_summary(changes_df, month_labels)
-
-        # 8. Write Excel
-        status.info("💾  生成 Excel 输出文件...")
-        excel_bytes = write_excel(compare_df, platform_df, changes_df, month_labels)
-        progress.progress(100)
-
-        # ── Success + Download ──────────────────────────────
-        status.empty()
-        st.success(f"✅  完成！共生成 {len(compare_df):,} 行数据")
-
-        filename = f"{cycle_m0}_vs_{cycle_m1}_IBP_Forecast_Compare.xlsx"
-
-        col1, col2, col3 = st.columns([1, 2, 1])
-        with col2:
-            st.download_button(
-                label=f"⬇️  下载  {filename}",
-                data=excel_bytes,
-                file_name=filename,
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
+        with st.spinner("Processing..."):
+            result_bytes, count = process(
+                ahmed_tmp,
+                BytesIO(prev_file.getvalue()),
+                BytesIO(master_file.getvalue()),
+                m0_cycle, m1_cycle, m0_label, m1_label, actuals_col
             )
 
-        # ── Preview ────────────────────────────────────────
-        with st.expander("📊 预览：Changes by Platform（前 10 行）"):
-            if not platform_df.empty:
-                preview_cols = ["Platform"] + [c for c in platform_df.columns if c != "Platform"][:6]
-                st.dataframe(platform_df[preview_cols].head(10), use_container_width=True)
+        os.remove(ahmed_tmp)
+        os.rmdir(tmp_dir)
 
-        with st.expander("📋 预览：Compare Packs（前 15 行）"):
-            if not compare_df.empty:
-                preview_cols = list(compare_df.columns[:9])
-                st.dataframe(compare_df[preview_cols].head(15), use_container_width=True)
+        out_name = f"{m0_cycle} vs {m1_cycle} IBP Forecast Compare.xlsx"
+        st.success(f"Generated: {out_name}  ({count} SKU+Region combinations)")
+        st.download_button(
+            label="Download Compare File",
+            data=result_bytes,
+            file_name=out_name,
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+    elif not all_uploaded:
+        st.info("Please upload all 3 files to enable generation.")
 
-    except Exception as e:
-        progress.empty()
-        st.error(f"❌  运行出错：{e}")
-        with st.expander("查看详细错误信息（发给维护人员）"):
-            st.code(traceback.format_exc())
 
-# ── Footer ───────────────────────────────────────────────────────────────────
-st.markdown("---")
-st.caption("IBP Forecast Compare Tool  v1.0  |  数据仅在运行时处理，不做任何储存")
+if __name__ == "__main__":
+    main()
