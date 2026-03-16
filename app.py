@@ -700,6 +700,28 @@ def _parse_prev_filename(name):
     return m0_cycle, m1_cycle, m0_label, m1_label, actuals_col
 
 
+def _init_setting_state(prev_file_name):
+    """Initialize editable setting fields without overwriting manual changes."""
+    defaults = _parse_prev_filename(prev_file_name) if prev_file_name else None
+
+    current_source = st.session_state.get("settings_source_file")
+    if current_source == prev_file_name:
+        return
+
+    def_m0 = defaults[0] if defaults else "202603"
+    def_m1 = defaults[1] if defaults else "202602"
+    def_m0_label = defaults[2] if defaults else "Mar Forecast"
+    def_m1_label = defaults[3] if defaults else "Feb Forecast"
+    def_actuals = defaults[4] if defaults else "M"
+
+    st.session_state["m0_cycle"] = def_m0
+    st.session_state["m1_cycle"] = def_m1
+    st.session_state["m0_label"] = def_m0_label
+    st.session_state["m1_label"] = def_m1_label
+    st.session_state["actuals_col"] = def_actuals
+    st.session_state["settings_source_file"] = prev_file_name
+
+
 def main():
     st.set_page_config(page_title="IBP Forecast Compare Tool", layout="wide")
     st.title("IBP Forecast Compare Tool")
@@ -711,16 +733,9 @@ def main():
     prev_file = c2.file_uploader("Previous Compare File (.xlsx)", type=["xlsx"])
     master_file = c3.file_uploader("Master Vlookup (.xlsx)", type=["xlsx"])
 
-    # --- Auto-detect cycles from prev filename ---
-    defaults = None
-    if prev_file is not None:
-        defaults = _parse_prev_filename(prev_file.name)
-
-    def_m0 = defaults[0] if defaults else "202603"
-    def_m1 = defaults[1] if defaults else "202602"
-    def_m0_label = defaults[2] if defaults else "Mar Forecast"
-    def_m1_label = defaults[3] if defaults else "Feb Forecast"
-    def_actuals = defaults[4] if defaults else "M"
+    # --- Auto-detect cycles from prev filename without clobbering edits ---
+    prev_file_name = prev_file.name if prev_file is not None else None
+    _init_setting_state(prev_file_name)
 
     # --- Settings ---
     st.subheader("Settings")
@@ -734,13 +749,13 @@ def main():
 """)
 
     s1, s2, s3 = st.columns(3)
-    m0_cycle = s1.text_input("M0 Cycle", def_m0)
-    m1_cycle = s2.text_input("M-1 Cycle", def_m1)
-    actuals_col = s3.text_input("Actuals Column Letter", def_actuals)
+    m0_cycle = s1.text_input("M0 Cycle", key="m0_cycle")
+    m1_cycle = s2.text_input("M-1 Cycle", key="m1_cycle")
+    actuals_col = s3.text_input("Actuals Column Letter", key="actuals_col")
 
     s4, s5 = st.columns(2)
-    m0_label = s4.text_input("M0 Label", def_m0_label)
-    m1_label = s5.text_input("M-1 Label", def_m1_label)
+    m0_label = s4.text_input("M0 Label", key="m0_label")
+    m1_label = s5.text_input("M-1 Label", key="m1_label")
 
     # --- Generate ---
     all_uploaded = ahmed_file is not None and prev_file is not None and master_file is not None
