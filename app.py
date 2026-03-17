@@ -815,9 +815,25 @@ def _init_setting_state(prev_file_name):
     st.session_state["settings_source_file"] = prev_file_name
 
 
+def _excel_com_available():
+    """Return True only when local Excel COM automation is available."""
+    try:
+        import win32com.client  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
 def main():
     st.set_page_config(page_title="IBP Forecast Compare Tool", layout="wide")
     st.title("IBP Forecast Compare Tool")
+
+    com_ok = _excel_com_available()
+    if not com_ok:
+        st.error(
+            "Pivot drill-down 需要本机 Windows + Excel（win32com）。当前环境不支持，"
+            "请在本地电脑运行，不要使用云端。"
+        )
 
     # --- File uploaders ---
     st.subheader("Upload Files")
@@ -852,7 +868,8 @@ def main():
 
     # --- Generate ---
     all_uploaded = ahmed_file is not None and prev_file is not None and master_file is not None
-    if st.button("Generate Compare File", type="primary", disabled=not all_uploaded):
+    can_generate = all_uploaded and com_ok
+    if st.button("Generate Compare File", type="primary", disabled=not can_generate):
         # pyxlsb needs a file on disk for .xlsb
         tmp_dir = tempfile.mkdtemp()
         ahmed_tmp = os.path.join(tmp_dir, ahmed_file.name)
@@ -880,6 +897,8 @@ def main():
         )
     elif not all_uploaded:
         st.info("Please upload all 3 files to enable generation.")
+    elif not com_ok:
+        st.warning("当前环境不支持 Excel COM，已禁用生成按钮。请在本机 Windows + Excel 环境运行。")
 
 
 if __name__ == "__main__":
