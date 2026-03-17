@@ -612,10 +612,112 @@ def _build_one_pivot(wb, data_sheet, pivot_sheet, a1_label, table_name,
     ws_pivot.Columns('I').ColumnWidth = 15.125
 
 
+def _calc_region_totals(rows, dates):
+    """Compute DELTA totals by region for pivot/fallback output."""
+    regions = ["AMERICAS", "ASIA PACIFIC", "EMEA"]
+    region_delta = {r: [0.0] * len(dates) for r in regions}
+    for row_data in rows:
+        if row_data[7] != "DELTA":
+            continue
+        reg = row_data[0]
+        if reg not in region_delta:
+            continue
+        for i, v in enumerate(row_data[8:]):
+            if isinstance(v, (int, float)):
+                region_delta[reg][i] += v
+
+    grand = [0.0] * len(dates)
+    for reg in regions:
+        for i in range(len(dates)):
+            grand[i] += region_delta[reg][i]
+
+    return regions, region_delta, grand
+
+
+def _write_one_pivot_fallback(ws, rows, dates, a1_label):
+    """Fallback pivot writer (non-COM), used when win32com is unavailable."""
+    delta_dates = dates[:18]
+    cumm_dates = [dates[0] - relativedelta(months=1)] + list(delta_dates)
+    regions, region_delta, grand = _calc_region_totals(rows, dates)
+
+    ws.cell(1, 1, a1_label).font = Font(bold=True)
+    ws.cell(4, 1, "Forecast Cycle")
+    ws.cell(4, 2, "DELTA")
+    ws.cell(5, 1, "PRODUCT_PLATFORM_NM")
+    ws.cell(5, 2, "(All)")
+
+    ws.cell(7, 2, "Values")
+    ws.cell(8, 1, "Reg")
+    for ci, dt in enumerate(delta_dates):
+        ws.cell(8, 2 + ci, f"Sum of {_date_label(dt)}")
+
+    for ri, reg in enumerate(regions):
+        r = 9 + ri
+        ws.cell(r, 1, reg)
+        for ci in range(len(delta_dates)):
+            c = ws.cell(r, 2 + ci, region_delta[reg][ci])
+            c.number_format = _PIVOT_NUM_FMT
+
+    gt_row = 9 + len(regions)
+    ws.cell(gt_row, 1, "Grand Total").font = Font(bold=True)
+    for ci in range(len(delta_dates)):
+        c = ws.cell(gt_row, 2 + ci, grand[ci])
+        c.number_format = _PIVOT_NUM_FMT
+        c.font = Font(bold=True)
+
+    r19 = 19
+    ws.cell(r19, 1, "CUMM Delta").font = Font(bold=True)
+    ws.cell(r20 := r19 + 1, 1, "Region")
+    for ci, dt in enumerate(cumm_dates):
+        ws.cell(r20, 2 + ci, f"Sum of {_date_label(dt)}")
+
+    for ri, reg in enumerate(regions):
+        r = r20 + 1 + ri
+        ws.cell(r, 1, reg)
+        running = 0.0
+        for ci in range(len(cumm_dates)):
+            if ci == 0:
+                running = region_delta[reg][0]
+            elif ci < len(delta_dates):
+                running += region_delta[reg][ci]
+            c = ws.cell(r, 2 + ci, running)
+            c.number_format = _PIVOT_NUM_FMT
+
+    gt2 = r20 + 1 + len(regions)
+    ws.cell(gt2, 1, "Grand Total").font = Font(bold=True)
+    running = 0.0
+    for ci in range(len(cumm_dates)):
+        if ci == 0:
+            running = grand[0]
+        elif ci < len(delta_dates):
+            running += grand[ci]
+        c = ws.cell(gt2, 2 + ci, running)
+        c.number_format = _PIVOT_NUM_FMT
+        c.font = Font(bold=True)
+
+    ws.column_dimensions['A'].width = 29.5
+    ws.column_dimensions['B'].width = 15.125
+    ws.column_dimensions['H'].width = 15.125
+    ws.column_dimensions['I'].width = 15.125
+
+
+def _create_pivot_tables_fallback(path, rows, singles_rows, dates):
+    """Create fallback (non-COM) pivot sheets for environments without Excel COM."""
+    wb = openpyxl.load_workbook(path)
+    _write_one_pivot_fallback(wb['Pivot Packs'], rows, dates, 'PACKS')
+    _write_one_pivot_fallback(wb['Pivot Singles'], singles_rows, dates, 'SINGLES')
+    wb.save(path)
+    wb.close()
+
+
 def _create_pivot_tables(path, rows, singles_rows, dates, m0_cycle):
     """Open workbook via COM and create PivotTables for both Packs and Singles."""
-    import win32com.client as win32
-    import pythoncom
+    try:
+        import win32com.client as win32
+        import pythoncom
+    except ModuleNotFoundError:
+        _create_pivot_tables_fallback(path, rows, singles_rows, dates)
+        return
 
     abs_path = os.path.abspath(path)
 
@@ -636,12 +738,27 @@ def _create_pivot_tables(path, rows, singles_rows, dates, m0_cycle):
 
         wb.Save()
         wb.Close(False)
+    except Exception:
+        if excel:
+            try:
+                excel.Quit()
+            except Exception:
+                pass
+        pythoncom.CoUninitialize()
+        _create_pivot_tables_fallback(path, rows, singles_rows, dates)
+        return
     finally:
         if excel:
-            excel.ScreenUpdating = True
-            excel.DisplayAlerts = True
-            excel.Quit()
-        pythoncom.CoUninitialize()
+            try:
+                excel.ScreenUpdating = True
+                excel.DisplayAlerts = True
+                excel.Quit()
+            except Exception:
+                pass
+        try:
+            pythoncom.CoUninitialize()
+        except Exception:
+            pass
 
 
 # ================================================================
