@@ -282,8 +282,8 @@ def write_excel(rows, dates, m0_label, m1_label,
 
     # --- Packs sheets ---
     ws_pivot = wb.active
-    ws_pivot.title = "Pivot"
-    ws_cbp = wb.create_sheet("Changes by Platform")
+    ws_pivot.title = "Pivot Packs"
+    ws_cbp = wb.create_sheet("Changes by Platform Packs")
     ws_cp = wb.create_sheet("Compare Packs")
     ws_pd = wb.create_sheet("PivotData")
 
@@ -383,23 +383,19 @@ def _write_changes_by_platform(ws, rows, dates, m0_label, m1_label,
         col_l = get_column_letter(ci)
         cell = ws.cell(1, ci, f"=SUBTOTAL(9,{col_l}4:{col_l}9999)")
         cell.number_format = _NUM_FMT
-    # SUBTOTAL for col H (Total change)
-    ws.cell(1, 8, "=SUBTOTAL(9,H4:H9999)").number_format = _NUM_FMT
-    # Col I: no subtotal (None)
-    # SUBTOTAL for second 6 date cols (J-O)
-    for ci in range(10, 10 + len(second6)):
+    # SUBTOTAL for second 6 date cols (H-M)
+    for ci in range(8, 8 + len(second6)):
         col_l = get_column_letter(ci)
         cell = ws.cell(1, ci, f"=SUBTOTAL(9,{col_l}4:{col_l}9999)")
         cell.number_format = _NUM_FMT
-    # SUBTOTAL for remaining empty cols (P-W) to match reference
-    for ci in range(10 + len(second6), 24):
+    # SUBTOTAL for remaining empty cols (N-W) to match reference
+    for ci in range(8 + len(second6), 24):
         col_l = get_column_letter(ci)
         cell = ws.cell(1, ci, f"=SUBTOTAL(9,{col_l}4:{col_l}9999)")
         cell.number_format = _NUM_FMT
 
     # --- Row 2: Title ---
     ws.cell(2, 1, f"{m0_month} vs {m1_month} Fcst Delta").font = Font(bold=True)
-    ws.cell(2, 9, "Not considered in compare packs").number_format = _NUM_FMT
 
     # --- Row 3: Headers ---
     ws.cell(3, 1, "Row Labels")
@@ -413,21 +409,9 @@ def _write_changes_by_platform(ws, rows, dates, m0_label, m1_label,
         cell.fill = _HEADER_FILL
         cell.font = _HEADER_FONT
 
-    # Col H: Total change till Q3
-    cell_h = ws.cell(3, 8, "Total change till Q3")
-    cell_h.fill = PatternFill(
-        fgColor=Color(theme=7, tint=0.7999816888943144), fill_type="solid")
-    cell_h.font = _HEADER_FONT
-
-    # Col I: Off cycle change
-    cell_i = ws.cell(3, 9, f"{m1_month} Off cycle change")
-    cell_i.fill = PatternFill(
-        fgColor=Color(theme=5, tint=0.7999816888943144), fill_type="solid")
-    cell_i.font = _HEADER_FONT
-
-    # Second 6 date columns (J-O)
+    # Second 6 date columns (H-M)
     for i, dt in enumerate(second6):
-        ci = 10 + i
+        ci = 8 + i
         cell = ws.cell(3, ci, _date_label(dt))
         cell.fill = _HEADER_FILL
         cell.font = _HEADER_FONT
@@ -442,17 +426,9 @@ def _write_changes_by_platform(ws, rows, dates, m0_label, m1_label,
             cell = ws.cell(r, 2 + i, all_vals[i])
             cell.number_format = _NUM_FMT
 
-        # Col H: SUM formula for first 6 months
-        cell_h = ws.cell(r, 8, f"=SUM(B{r}:G{r})")
-        cell_h.number_format = _NUM_FMT
-
-        # Col I: Off cycle = 0
-        cell_i = ws.cell(r, 9, 0)
-        cell_i.number_format = _NUM_FMT
-
         # Second 6 months
         for i in range(len(second6)):
-            cell = ws.cell(r, 10 + i, all_vals[6 + i])
+            cell = ws.cell(r, 8 + i, all_vals[6 + i])
             cell.number_format = _NUM_FMT
 
     # Autofilter: A3:W{last_row} matching reference
@@ -653,7 +629,7 @@ def _create_pivot_tables(path, rows, singles_rows, dates, m0_cycle):
 
         wb = excel.Workbooks.Open(abs_path)
 
-        _build_one_pivot(wb, 'PivotData', 'Pivot',
+        _build_one_pivot(wb, 'PivotData', 'Pivot Packs',
                          'PACKS', 'PivotDelta', rows, dates)
         _build_one_pivot(wb, 'PivotData Singles', 'Pivot Singles',
                          'SINGLES', 'PivotDeltaSingles', singles_rows, dates)
